@@ -1,0 +1,2 @@
+[use-thundercloud]
+directory = "{{PROJECT}}/niches/project-settings/local"

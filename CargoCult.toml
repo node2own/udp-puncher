@@ -1,0 +1,13 @@
+niches-directory = "niches"
+
+[[psychotropic.cues]]
+name = "profile"
+use-thundercloud = { directory = "{{PROJECT}}/niches/profile/local" }
+
+[[psychotropic.cues]]
+name = "project-settings"
+use-thundercloud = { directory = "{{PROJECT}}/niches/project-settings/local" }
+wait-for = ["profile"]
+
+[[psychotropic.cues]]
+name = "#main"
