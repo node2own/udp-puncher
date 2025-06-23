@@ -7,21 +7,82 @@ use std::io;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{anyhow,Result};
+use bytes::{Bytes, BytesMut};
 use gethostname::gethostname;
 use log::{debug, info};
 use mio::event::Source;
 use mio::{Interest as InterestMio, Registry, Token};
 use mio::unix::SourceFd;
+use network_types::ip::IpProto;
 use socket2::{Socket, Domain, Type, Protocol};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
+use zerocopy::{transmute_mut, transmute_ref, Immutable, IntoBytes};
+use crate::Role::{Initiator, Listener};
 
 const MSG_MAX_LEN: usize = 1024;
+const IPHDR_SIZE: usize = 20;
+const VERSION_IHL: u8 = 0x45;
+const IPDEFTTL: u8 = 64;
+
+#[derive(Eq,PartialEq)]
+pub enum Role {
+    Listener,
+    Initiator,
+}
+
+#[repr(C)]
+#[derive(Debug,Default, IntoBytes, Immutable)]
+struct IpHeader {
+    version_ihl: u8,
+    type_of_service: u8,
+    total_length: u16,
+
+    identification: u16,
+    flags_fragment: u16,
+
+    time_to_live: u8,
+    protocol: u8,
+    header_checksum: u16,
+
+    source_address: u32,
+
+    destination_address: u32,
+}
+
+impl IpHeader {
+    pub fn as_slice(&self) -> &[u8; size_of::<IpHeader>()] {
+        transmute_ref!(self)
+    }
+}
+
+#[repr(C)]
+#[derive(Debug,Default,IntoBytes,Immutable)]
+struct IcmpBody {
+    icmp_type: u8,
+    icmp_code: u8,
+    checksum: u16,
+    identification: u16,
+    sequence_number: u16,
+}
+
+impl IcmpBody {
+    pub fn as_slice(&self) -> &[u8; size_of::<IcmpBody>()] {
+        transmute_ref!(self)
+    }
+}
+
+#[derive(Default)]
+struct IcmpPacket {
+    ip_header: IpHeader,
+    icmp_body: IcmpBody,
+}
 
 struct Client {
     id: u16,
@@ -39,17 +100,22 @@ struct Client {
     resend_count: usize,
 }
 
-pub async fn udp_puncher() -> Result<()> {
+pub async fn udp_puncher(role: Role) -> Result<()> {
     info!("UDP-puncher");
     debug!("MSG_MAX_LEN: {MSG_MAX_LEN:?}");
-    let dest_addr = UdpSocket::bind("3.3.3.3:0").await?;
+    let fake_addr = Ipv4Addr::from_str("3.3.3.3:0")?;
     let port = "2222";
     let host = gethostname().into_string().map_err(|e|anyhow!("{:?}", e))?;
 
+    let (src_addr, dest_addr) = match role {
+        Listener => (fake_addr, Ipv4Addr::from(0u32)),
+        Initiator => (Ipv4Addr::from_str(&host)?, fake_addr),
+    };
+
+
     let mut clients: Vec<Client> = Vec::new();
-    let address_string = host + ":" + port;
-    let rsrc = UdpSocket::bind(address_string.clone()).await?;
-    debug!("Listening on UDP: {:?}, {:?}", &rsrc, &address_string);
+    let rsrc = Ipv4Addr::from_str(&host)?;
+    debug!("Host IP: {:?}, {:?}", &rsrc, &host);
 
     let udp_from = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -57,7 +123,8 @@ pub async fn udp_puncher() -> Result<()> {
     debug!("List socket: {listen_socket:?}");
 
     let raw_protocol = Protocol::from(255);
-    let icmp_socket = IcmpSocketMio::new(Some(raw_protocol))?;
+    let icmp_socket_mio = IcmpSocketMio::new(Some(raw_protocol))?;
+    let icmp_socket = IcmpSocketTokio::wrap(icmp_socket_mio)?;
     debug!("ICMP socket: {icmp_socket:?}");
 
     let mut periodic = time::interval(Duration::from_millis(5000));
@@ -66,14 +133,125 @@ pub async fn udp_puncher() -> Result<()> {
         tokio::select! {
             _ = periodic.tick() => {
                 debug!("periodic tick");
-                send_icmp(&icmp_socket).await;
+                send_icmp(&icmp_socket, &rsrc, src_addr, dest_addr, Listener).await?;
             }
         }
     }
 }
 
-async fn send_icmp(_socket: &IcmpSocketMio) {
+async fn send_icmp(socket: &IcmpSocketTokio, rsrc: &Ipv4Addr, dest_addr: Ipv4Addr, src_addr: Ipv4Addr, role: Role) -> Result<()> {
     debug!("Sending ICMP packet");
+    let mut packet_length = size_of::<IcmpPacket>() as u16;
+    if role != Listener {
+        packet_length *= 2;
+    }
+    let mut icmp_packet: IcmpPacket = Default::default();
+    icmp_packet.ip_header.version_ihl = VERSION_IHL;
+    icmp_packet.ip_header.type_of_service = 0;
+    icmp_packet.ip_header.total_length = htons(packet_length);
+    icmp_packet.ip_header.identification = htons(1); // kernel sets proper value htons(ip_id_counter);
+    icmp_packet.ip_header.flags_fragment = 0;
+    icmp_packet.ip_header.time_to_live = IPDEFTTL;
+    icmp_packet.ip_header.protocol = IpProto::Icmp as u8;
+    icmp_packet.ip_header.header_checksum = 0; // maybe the kernel helps us out..?
+    icmp_packet.ip_header.source_address = htonl(rsrc.to_bits());
+    icmp_packet.ip_header.destination_address = htonl(dest_addr.to_bits());
+
+    let header = icmp_packet.ip_header.as_bytes();
+
+    icmp_packet.icmp_body.icmp_type = match role {
+        Listener => 8,  // ICMP echo request
+        Initiator => 11, // ICMP time exceeded
+    };
+
+    icmp_packet.icmp_body.icmp_code = 0;
+    icmp_packet.icmp_body.identification = 0;
+    icmp_packet.icmp_body.sequence_number = 0;
+    icmp_packet.icmp_body.checksum = 0;
+
+    let mut body = BytesMut::with_capacity(packet_length as usize - size_of::<IpHeader>());
+    let body_bytes = icmp_packet.icmp_body.as_bytes();
+    body.extend_from_slice(body_bytes.as_ref());
+
+    if role == Initiator {
+        let mut fake_original: IcmpPacket = Default::default();
+        fake_original.ip_header.version_ihl = VERSION_IHL;
+        fake_original.ip_header.type_of_service = 0;
+        fake_original.ip_header.total_length = htons((size_of::<IcmpPacket>() as u16) << 8);
+        fake_original.ip_header.identification = htons(1); // kernel sets proper value htons(ip_id_counter);
+        fake_original.ip_header.flags_fragment = 0;
+        fake_original.ip_header.time_to_live = 1; // real TTL would be 1 on a time exceeded packet
+        fake_original.ip_header.protocol = IpProto::Icmp as u8;
+        fake_original.ip_header.header_checksum = 0; // maybe the kernel helps us out..?
+        fake_original.ip_header.source_address = htonl(dest_addr.to_bits());
+        fake_original.ip_header.destination_address = htonl(src_addr.to_bits());
+
+        fake_original.icmp_body.icmp_type = 8;  // ICMP echo request
+        fake_original.icmp_body.icmp_code = 0;
+        fake_original.icmp_body.identification = 0;
+        fake_original.icmp_body.sequence_number = 0;
+        fake_original.icmp_body.checksum = 0;
+        let (header_checksum, body_checksum) = {
+            let fake_original_header = fake_original.ip_header.as_bytes();
+            let fake_original_body = fake_original.icmp_body.as_bytes();
+            (check_sum(fake_original_header), check_sum(fake_original_body))
+        };
+        fake_original.ip_header.header_checksum = header_checksum;
+        fake_original.icmp_body.checksum = body_checksum;
+        body.extend_from_slice(fake_original.ip_header.as_bytes());
+        body.extend_from_slice(fake_original.icmp_body.as_bytes());
+    }
+    icmp_packet.icmp_body.checksum = check_sum(body.as_ref());
+
+    let mut message = BytesMut::with_capacity(packet_length as usize);
+    message.extend_from_slice(header.as_ref());
+    message.extend_from_slice(body.as_ref());
+    let message = message.freeze();
+    debug("Sending ICMP packet", &message);
+    socket.send(message.as_ref()).await?;
+    Ok(())
+}
+
+fn debug<S: Into<String>>(label: S, bytes: &Bytes) {
+    let buf = bytes.as_ref();
+    let mut iter = buf.iter();
+    let mut cursor = 0;
+    let mut end = false;
+    debug!("{}: [", label.into());
+    loop {
+        let mut line = format!("  {cursor:#4X}:");
+        for _ in 0..16 {
+            if let Some(byte) = iter.next() {
+                let part = format!(" {byte:#2X}");
+                line.push_str(&part);
+                cursor += 1;
+            } else {
+                end = true;
+                break;
+            }
+        }
+        debug!("{}", line);
+        if end {
+            break;
+        }
+    }
+    debug!("]");
+}
+
+fn check_sum(packet_bytes: &[u8]) -> u16 {
+    let mut  it = packet_bytes.into_iter();
+    let mut sum = 0;
+    loop {
+        if let Some(msb) = it.next() {
+            if let Some(lsb) = it.next() {
+                let short: u16 = ((msb.clone() as u16) << 8) + lsb.clone() as u16;
+                sum += short;
+                continue;
+            }
+        }
+        break;
+    }
+    sum ^ 0xFFFF
 }
 
 /// An ICMP socket used with low-level `mio` events.
@@ -185,6 +363,10 @@ impl IcmpSocketTokio {
     /// `new` returns a "no permission" error if `CAP_NET_RAW` is unavailable.
     pub fn new() -> io::Result<Self> {
         let mio_sck = IcmpSocketMio::new(Some(Protocol::ICMPV4))?;
+        IcmpSocketTokio::wrap(mio_sck)
+    }
+
+    pub fn wrap(mio_sck: IcmpSocketMio) -> io::Result<Self> {
         let fd_mio_sck = AsyncFd::new(mio_sck)?;
         Ok(Self {
             sck: Arc::new(fd_mio_sck),
@@ -336,4 +518,14 @@ pub fn create_echo_pkt(id: u16, seq: u16) -> [u8; PKT_BUF_SIZE] {
 pub fn read_seq_from_echo_pkt(buf: [u8; PKT_BUF_SIZE]) -> u16 {
     let a = unsafe { *(buf[26..].as_ptr() as *const [u8; 2]) };
     u16::from_be_bytes(a)
+}
+/// Converts a value from host byte order to network byte order.
+#[inline]
+fn htons(hostshort: u16) -> u16 {
+    hostshort.to_be()
+}
+/// Converts a value from host byte order to network byte order.
+#[inline]
+fn htonl(hostlong: u32) -> u32 {
+    hostlong.to_be()
 }
