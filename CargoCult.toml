@@ -11,3 +11,15 @@ wait-for = ["profile"]
 
 [[psychotropic.cues]]
 name = "#main"
+
+[[psychotropic.cues]]
+name = "nix-in-docker"
+
+[psychotropic.cues.use-thundercloud]
+
+directory = "{{WORKSPACE}}/thunderclouds-for-chores/nix-in-docker"
+
+[psychotropic.cues.use-thundercloud.git-remote]
+fetch-url = "https://github.com/rustigaan/thunderclouds-for-chores.git"
+revision = "main"
+sub-path = "nix-in-docker"
