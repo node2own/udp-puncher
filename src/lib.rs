@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow,Result};
 use bytes::{Bytes, BytesMut};
 use gethostname::gethostname;
+use local_ip_address::local_ip;
 use log::{debug, info};
 use mio::event::Source;
 use mio::{Interest as InterestMio, Registry, Token};
@@ -23,7 +24,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
-use zerocopy::{transmute_mut, transmute_ref, Immutable, IntoBytes};
+use zerocopy::{transmute_ref, Immutable, IntoBytes};
 use crate::Role::{Initiator, Listener};
 
 const MSG_MAX_LEN: usize = 1024;
@@ -100,22 +101,35 @@ struct Client {
     resend_count: usize,
 }
 
+trait Ipv4AddrExt {
+    fn from_str_ext(s: &str) -> Result<Ipv4Addr>;
+}
+
+impl Ipv4AddrExt for Ipv4Addr {
+    fn from_str_ext(s: &str) -> Result<Ipv4Addr> {
+        Ipv4Addr::from_str(s).map_err(|e| anyhow!("{e}: {s:?}"))
+    }
+}
+
 pub async fn udp_puncher(role: Role) -> Result<()> {
     info!("UDP-puncher");
     debug!("MSG_MAX_LEN: {MSG_MAX_LEN:?}");
-    let fake_addr = Ipv4Addr::from_str("3.3.3.3:0")?;
+    let fake_addr = Ipv4Addr::from_str_ext("3.3.3.3")?;
     let port = "2222";
     let host = gethostname().into_string().map_err(|e|anyhow!("{:?}", e))?;
+    debug!("Host: {host:?}");
+    let host_ip = local_ipv4()?;
+    debug!("Host IP: {host_ip:?}");
 
     let (src_addr, dest_addr) = match role {
         Listener => (fake_addr, Ipv4Addr::from(0u32)),
-        Initiator => (Ipv4Addr::from_str(&host)?, fake_addr),
+        Initiator => (host_ip, fake_addr),
     };
 
 
     let mut clients: Vec<Client> = Vec::new();
-    let rsrc = Ipv4Addr::from_str(&host)?;
-    debug!("Host IP: {:?}, {:?}", &rsrc, &host);
+    let rsrc = host_ip;
+    debug!("Rsrc: {:?}, {:?}", &rsrc, &host);
 
     let udp_from = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
 
@@ -139,8 +153,16 @@ pub async fn udp_puncher(role: Role) -> Result<()> {
     }
 }
 
+fn local_ipv4() -> Result<Ipv4Addr> {
+    let ip = local_ip()?;
+    if let IpAddr::V4(ipv4_addr) = ip {
+        return Ok(ipv4_addr);
+    }
+    Err(anyhow!("Not an IPv4 address: {ip:?}"))
+}
+
 async fn send_icmp(socket: &IcmpSocketTokio, rsrc: &Ipv4Addr, dest_addr: Ipv4Addr, src_addr: Ipv4Addr, role: Role) -> Result<()> {
-    debug!("Sending ICMP packet");
+    debug!("Sending ICMP packet: {rsrc:?} -> {dest_addr:?}");
     let mut packet_length = size_of::<IcmpPacket>() as u16;
     if role != Listener {
         packet_length *= 2;
@@ -153,9 +175,13 @@ async fn send_icmp(socket: &IcmpSocketTokio, rsrc: &Ipv4Addr, dest_addr: Ipv4Add
     icmp_packet.ip_header.flags_fragment = 0;
     icmp_packet.ip_header.time_to_live = IPDEFTTL;
     icmp_packet.ip_header.protocol = IpProto::Icmp as u8;
-    icmp_packet.ip_header.header_checksum = 0; // maybe the kernel helps us out..?
+    icmp_packet.ip_header.header_checksum = 0;
     icmp_packet.ip_header.source_address = htonl(rsrc.to_bits());
     icmp_packet.ip_header.destination_address = htonl(dest_addr.to_bits());
+
+    let header_checksum = check_sum(icmp_packet.ip_header.as_bytes());
+    debug!("Header checksum: {:#4X}", header_checksum);
+    icmp_packet.ip_header.header_checksum = htons(header_checksum);
 
     let header = icmp_packet.ip_header.as_bytes();
 
@@ -172,8 +198,10 @@ async fn send_icmp(socket: &IcmpSocketTokio, rsrc: &Ipv4Addr, dest_addr: Ipv4Add
     let mut body = BytesMut::with_capacity(packet_length as usize - size_of::<IpHeader>());
     let body_bytes = icmp_packet.icmp_body.as_bytes();
     body.extend_from_slice(body_bytes.as_ref());
+    let mut more_body_bytes = BytesMut::with_capacity(size_of::<IcmpPacket>());
 
     if role == Initiator {
+        debug!("Create fake original: {dest_addr:?} -> {src_addr:?}");
         let mut fake_original: IcmpPacket = Default::default();
         fake_original.ip_header.version_ihl = VERSION_IHL;
         fake_original.ip_header.type_of_service = 0;
@@ -196,19 +224,28 @@ async fn send_icmp(socket: &IcmpSocketTokio, rsrc: &Ipv4Addr, dest_addr: Ipv4Add
             let fake_original_body = fake_original.icmp_body.as_bytes();
             (check_sum(fake_original_header), check_sum(fake_original_body))
         };
-        fake_original.ip_header.header_checksum = header_checksum;
-        fake_original.icmp_body.checksum = body_checksum;
-        body.extend_from_slice(fake_original.ip_header.as_bytes());
-        body.extend_from_slice(fake_original.icmp_body.as_bytes());
+        debug!("Fake original checksums: [ header: {header_checksum:#4X}, body: {body_checksum:#4X} ]");
+        fake_original.ip_header.header_checksum = htons(header_checksum);
+        fake_original.icmp_body.checksum = htons(body_checksum);
+        more_body_bytes.extend_from_slice(fake_original.ip_header.as_bytes());
+        more_body_bytes.extend_from_slice(fake_original.icmp_body.as_bytes());
+        body.extend_from_slice(&more_body_bytes);
     }
-    icmp_packet.icmp_body.checksum = check_sum(body.as_ref());
+    let body_checksum = check_sum(body.as_ref());
+    debug!("body checksum: {:#4X}", body_checksum);
+    icmp_packet.icmp_body.checksum = htons(body_checksum);
+
+    let mut body = BytesMut::with_capacity(packet_length as usize - size_of::<IpHeader>());
+    body.extend_from_slice(icmp_packet.icmp_body.as_bytes());
+    body.extend_from_slice(&more_body_bytes);
 
     let mut message = BytesMut::with_capacity(packet_length as usize);
     message.extend_from_slice(header.as_ref());
     message.extend_from_slice(body.as_ref());
     let message = message.freeze();
     debug("Sending ICMP packet", &message);
-    socket.send(message.as_ref()).await?;
+    let signature = ((header_checksum as u32) << 16) | body_checksum as u32;
+    socket.send(message.as_ref()).await.map_err(|e| anyhow!("Error sending {signature:#8X}: {e}"))?;
     Ok(())
 }
 
@@ -222,7 +259,7 @@ fn debug<S: Into<String>>(label: S, bytes: &Bytes) {
         let mut line = format!("  {cursor:#4X}:");
         for _ in 0..16 {
             if let Some(byte) = iter.next() {
-                let part = format!(" {byte:#2X}");
+                let part = format!(" {byte:02X}");
                 line.push_str(&part);
                 cursor += 1;
             } else {
