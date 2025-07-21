@@ -23,8 +23,13 @@ fn app() -> Result<()> {
         exit(1); // This kills all threads
     })?;
 
+    let mut remotes = vec![];
+    for arg in std::env::args().skip(1) {
+        remotes.push(arg);
+    }
+
     let listener_handle = panic_on_exit("Listener",|| udp_puncher(Role::Listener));
-    let initiator_handle = panic_on_exit("Initiator", || udp_puncher(Role::Initiator));
+    let initiator_handle = panic_on_exit("Initiator", || udp_puncher(Role::Initiator(remotes)));
     listener_handle.join().map_err(|e| anyhow!("{e:?}"))?;
     initiator_handle.join().map_err(|e| anyhow!("{e:?}"))?;
     Ok(())
