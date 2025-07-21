@@ -10,8 +10,5 @@ env_logger = "^0.11.8"
 gethostname = "^1.0.2"
 local-ip-address = "0.6.5"
 log = "^0.4.27"
-mio = { version = "1.0.4", features = ["os-poll", "net", "os-ext"] }
 network-types = "^0.0.8"
-socket2 = { version = "^0.5.10", features = ["all"] }
-tokio = { version = "^1.45.1", features = ["full"] }
 zerocopy = { version = "^0.8.26", features = ["derive"] }
