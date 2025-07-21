@@ -3,21 +3,24 @@
 //! * [pwnat](https://github.com/samyk/pwnat) UDP tunneling between devices behind NAT without third-party
 //! * [ping](https://github.com/rana/ping) Rust implementation of `ping`
 
-use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::mem;
+use std::mem::MaybeUninit;
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::os::fd::AsRawFd;
 use std::str::FromStr;
 use std::time::Duration;
 use anyhow::{anyhow,Result};
 use bytes::{Bytes, BytesMut};
+use errno::errno;
 use gethostname::gethostname;
 use local_ip_address::local_ip;
 use log::{debug, info};
 use network_types::ip::IpProto;
-use zerocopy::{transmute_ref, Immutable, IntoBytes};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use zerocopy::{Immutable, IntoBytes};
 use crate::Role::{Initiator, Listener};
 
 const MSG_MAX_LEN: usize = 1024;
-const IPHDR_SIZE: usize = 20;
 const VERSION_IHL: u8 = 0x45;
 const IPDEFTTL: u8 = 64;
 
@@ -46,12 +49,6 @@ struct IpHeader {
     destination_address: u32,
 }
 
-impl IpHeader {
-    pub fn as_slice(&self) -> &[u8; size_of::<IpHeader>()] {
-        transmute_ref!(self)
-    }
-}
-
 #[repr(C)]
 #[derive(Debug,Default,IntoBytes,Immutable)]
 struct IcmpBody {
@@ -62,33 +59,16 @@ struct IcmpBody {
     sequence_number: u16,
 }
 
-impl IcmpBody {
-    pub fn as_slice(&self) -> &[u8; size_of::<IcmpBody>()] {
-        transmute_ref!(self)
-    }
-}
-
 #[derive(Default)]
 struct IcmpPacket {
     ip_header: IpHeader,
     icmp_body: IcmpBody,
 }
 
-#[derive(Debug)]
-struct RawSocket {}
-impl RawSocket {
-    fn new() -> Self {
-        RawSocket {}
-    }
-    fn send(&self, _buf: &[u8]) -> io::Result<usize> {
-        todo!("Implement send")
-    }
-}
-
 struct Client {
     id: u16,
-    udp_sock: RawSocket,
-    tcp_sock: RawSocket,
+    udp_sock: Socket,
+    tcp_sock: Socket,
     connected: bool,
     keepalive: Duration,
     udp2tcp: [u8;MSG_MAX_LEN],
@@ -121,28 +101,28 @@ pub fn udp_puncher(role: Role) -> Result<()> {
     let host_ip = local_ipv4()?;
     debug!("Host IP: {host_ip:?}");
 
-    let (src_addr, dest_addr) = match role {
+    let (src_addr, dest_addr) = match &role {
         Listener => (fake_addr, Ipv4Addr::from(0u32)),
         Initiator => (host_ip, fake_addr),
     };
-
 
     let _clients: Vec<Client> = Vec::new();
     let rsrc = host_ip;
     debug!("Rsrc: {:?}, {:?}", &rsrc, &host);
 
-
-    let listen_socket = RawSocket::new();
-    debug!("List socket: {listen_socket:?}");
-
-    let icmp_socket = RawSocket::new();
-    debug!("ICMP socket: {icmp_socket:?}");
+    let listen_socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    debug!("Listen socket FD: {:?}", listen_socket.as_raw_fd());
 
     let interval = Duration::from_millis(5000);
 
+    let raw_protocol = Protocol::from(255);
+    let icmp_socket = Socket::new(Domain::IPV4, Type::RAW, Some(raw_protocol))?;
+    icmp_socket.set_read_timeout(Some(interval))?;
+    debug!("ICMP socket FD: {:?}", icmp_socket.as_raw_fd());
+
     loop {
-        send_icmp(&icmp_socket, &rsrc, src_addr, dest_addr, Listener)?;
-        std::thread::sleep(interval);
+        send_icmp(&icmp_socket, &rsrc, src_addr, dest_addr, &role)?;
+        receive_connection(&icmp_socket)?;
     }
 }
 
@@ -154,10 +134,10 @@ fn local_ipv4() -> Result<Ipv4Addr> {
     Err(anyhow!("Not an IPv4 address: {ip:?}"))
 }
 
-fn send_icmp(socket: &RawSocket, rsrc: &Ipv4Addr, dest_addr: Ipv4Addr, src_addr: Ipv4Addr, role: Role) -> Result<()> {
+fn send_icmp(socket: &Socket, rsrc: &Ipv4Addr, dest_addr: Ipv4Addr, src_addr: Ipv4Addr, role: &Role) -> Result<()> {
     debug!("Sending ICMP packet: {rsrc:?} -> {dest_addr:?}");
     let mut packet_length = size_of::<IcmpPacket>() as u16;
-    if role != Listener {
+    if *role != Listener {
         packet_length *= 2;
     }
     let mut icmp_packet: IcmpPacket = Default::default();
@@ -193,7 +173,7 @@ fn send_icmp(socket: &RawSocket, rsrc: &Ipv4Addr, dest_addr: Ipv4Addr, src_addr:
     body.extend_from_slice(body_bytes.as_ref());
     let mut more_body_bytes = BytesMut::with_capacity(size_of::<IcmpPacket>());
 
-    if role == Initiator {
+    if *role == Initiator {
         debug!("Create fake original: {dest_addr:?} -> {src_addr:?}");
         let mut fake_original: IcmpPacket = Default::default();
         fake_original.ip_header.version_ihl = VERSION_IHL;
@@ -238,8 +218,38 @@ fn send_icmp(socket: &RawSocket, rsrc: &Ipv4Addr, dest_addr: Ipv4Addr, src_addr:
     let message = message.freeze();
     debug("Sending ICMP packet", &message);
     let signature = ((header_checksum as u32) << 16) | body_checksum as u32;
-    socket.send(message.as_ref()).map_err(|e| anyhow!("Error sending {signature:#8X}: {e}"))?;
+    let sock_addr_v4 = SocketAddrV4::new(dest_addr, 2222);
+    let sock_addr = SockAddr::from(sock_addr_v4);
+    socket.send_to(message.as_ref(), &sock_addr).map_err(|e| anyhow!("Error sending {signature:#8X}: {e}"))?;
     Ok(())
+}
+
+fn receive_connection(socket: &Socket) -> Result<()> {
+    let mut maybe_uninit: [MaybeUninit<u8>; MSG_MAX_LEN] = [const { MaybeUninit::uninit() }; MSG_MAX_LEN ];
+    let size = socket.recv(& mut maybe_uninit);
+    match size {
+        Ok(size) => {
+            debug!("Received ICMP packet");
+            if size > 0 {
+                unsafe {
+                    let buffer = mem::transmute::<_, [u8; MSG_MAX_LEN]>(maybe_uninit);
+                    let mut bytes = BytesMut::new();
+                    bytes.extend_from_slice(&buffer[1..size]);
+                    debug("Received ICMP packet", &bytes.freeze());
+                }
+            }
+            Ok(())
+        },
+        Err(e) => {
+            let err = errno().0;
+            if err == 11 {
+                debug!("No packet");
+                Ok(())
+            } else {
+                Err(anyhow!("Error receiving ICMP packet: {e}: {err}"))
+            }
+        }
+    }
 }
 
 fn debug<S: Into<String>>(label: S, bytes: &Bytes) {
